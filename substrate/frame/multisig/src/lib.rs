@@ -55,6 +55,7 @@ use frame_support::{
 		PostDispatchInfo,
 	},
 	ensure,
+	transactional,
 	traits::{Currency, Get, ReservableCurrency},
 	weights::Weight,
 	BoundedVec,
@@ -70,9 +71,13 @@ use sp_std::prelude::*;
 pub use weights::WeightInfo;
 
 pub use pallet::*;
+use sp_runtime::traits::ConstU32;
 
 /// The log target of this pallet.
 pub const LOG_TARGET: &'static str = "runtime::multisig";
+
+/// Maximum size of call we can store is 4mb.
+const MAX_SIZE: u32 = 4 * 1024 * 1024;
 
 // syntactic sugar for logging.
 #[macro_export]
@@ -96,9 +101,9 @@ type BalanceOf<T> =
 )]
 pub struct Timepoint<BlockNumber> {
 	/// The height of the chain at the point in time.
-	height: BlockNumber,
+	pub height: BlockNumber,
 	/// The index of the extrinsic at the point in time.
-	index: u32,
+	pub index: u32,
 }
 
 /// An open multisig operation.
@@ -109,13 +114,31 @@ where
 	MaxApprovals: Get<u32>,
 {
 	/// The extrinsic when the multisig operation was opened.
-	when: Timepoint<BlockNumber>,
+	pub when: Timepoint<BlockNumber>,
 	/// The amount held in reserve of the `depositor`, to be returned once the operation ends.
-	deposit: Balance,
+	pub deposit: Balance,
 	/// The account who opened it (i.e. the first to approve it).
-	depositor: AccountId,
+	pub depositor: AccountId,
 	/// The approvals achieved so far, including the depositor. Always sorted.
-	approvals: BoundedVec<AccountId, MaxApprovals>,
+	pub approvals: BoundedVec<AccountId, MaxApprovals>,
+	/// Call data to execute.
+	pub call: Option<BoundedVec<u8, ConstU32<MAX_SIZE>>>,
+	/// If the call hash been executed.
+	pub finished: bool,
+}
+
+#[derive(Clone, Eq, PartialEq, Encode, Decode, Default, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+#[scale_info(skip_type_params(MaxSignatories))]
+pub struct MultisigOrigin<AccountId, MaxSignatories>
+where
+	MaxSignatories: Get<u32>,
+{
+	/// The multisig account.
+	pub multisig: AccountId,
+	/// signatories for this multisig.
+	pub signatories: BoundedVec<AccountId, MaxSignatories>,
+	/// The total number of approvals for this dispatch before it is executed.
+	pub threshold: u16,
 }
 
 type CallHash = [u8; 32];
@@ -164,6 +187,17 @@ pub mod pallet {
 		#[pallet::constant]
 		type MaxSignatories: Get<u32>;
 
+		/// The maximum amount of multisig for one account.
+		#[pallet::constant]
+		type MaxMultisigs: Get<u32>;
+
+		/// The maximum amount of calls for one multisig.
+		#[pallet::constant]
+		type MaxCalls: Get<u32>;
+
+		/// Treasury account for multisig create.
+		type TreasuryAccount: Get<Self::AccountId>;
+
 		/// Weight information for extrinsics in this pallet.
 		type WeightInfo: WeightInfo;
 	}
@@ -185,6 +219,37 @@ pub mod pallet {
 		[u8; 32],
 		Multisig<BlockNumberFor<T>, BalanceOf<T>, T::AccountId, T::MaxSignatories>,
 	>;
+
+	/// The multisigs for target account
+	#[pallet::storage]
+	pub type MultisigsForAccount<T: Config> = StorageMap<
+		_,
+		Blake2_128Concat,
+		T::AccountId,
+		BoundedVec<MultisigOrigin<T::AccountId, T::MaxSignatories>, T::MaxMultisigs>,
+		ValueQuery,
+	>;
+
+	/// The executed calls for the multisig.
+	#[pallet::storage]
+	pub type ExecutedCalls<T: Config> = StorageMap<
+		_,
+		Blake2_128Concat,
+		T::AccountId,
+		BoundedVec<CallHash, T::MaxCalls>,
+		ValueQuery,
+	>;
+
+	/// The unexecuted calls for the multisig.
+	#[pallet::storage]
+	pub type UnexecutedCalls<T: Config> = StorageMap<
+		_,
+		Blake2_128Concat,
+		T::AccountId,
+		BoundedVec<CallHash, T::MaxCalls>,
+		ValueQuery,
+	>;
+
 
 	#[pallet::error]
 	pub enum Error<T> {
@@ -216,6 +281,16 @@ pub mod pallet {
 		MaxWeightTooLow,
 		/// The data to be stored is already stored.
 		AlreadyStored,
+		/// Call data invalid for codec.
+		InvalidCall,
+		/// Multisig account has been registered.
+		MultisigAlreadyRegistered,
+		/// There are too many multisigs for the account.
+		TooManyMultisigs,
+		/// There are too many call hashes for the multisig.
+		TooManyCalls,
+		/// The call already executed.
+		CallExecuted,
 	}
 
 	#[pallet::event]
@@ -244,6 +319,11 @@ pub mod pallet {
 			timepoint: Timepoint<BlockNumberFor<T>>,
 			multisig: T::AccountId,
 			call_hash: CallHash,
+		},
+		/// New multi account has been created.
+		MultiAccountCreated {
+			sender: T::AccountId,
+			multisig: T::AccountId,
 		},
 	}
 
@@ -288,9 +368,16 @@ pub mod pallet {
 			let signatories = Self::ensure_sorted_and_insert(other_signatories, who)?;
 
 			let id = Self::multi_account_id(&signatories, 1);
-
-			let call_len = call.using_encoded(|c| c.len());
-			let result = call.dispatch(RawOrigin::Signed(id).into());
+			let (call_hash, call_len) = call.using_encoded(|d| (blake2_256(&(d, Self::timepoint()).encode()), d.len()));
+			let result = call.dispatch(RawOrigin::Signed(id.clone()).into());
+			let mut executed_calls = ExecutedCalls::<T>::get(&id);
+			let pos = executed_calls.len() as usize;
+			if pos >= T::MaxCalls::get() as usize {
+				// remove the first call
+				executed_calls.remove(0);
+			}
+			executed_calls.try_insert(pos, call_hash).expect("insert executed calls should successfully");
+			ExecutedCalls::<T>::insert(&id, executed_calls);
 
 			result
 				.map(|post_dispatch_info| {
@@ -362,6 +449,7 @@ pub mod pallet {
 			.max(T::WeightInfo::as_multi_complete(s, z))
 			.saturating_add(*max_weight)
 		})]
+		#[transactional]
 		pub fn as_multi(
 			origin: OriginFor<T>,
 			threshold: u16,
@@ -419,6 +507,7 @@ pub mod pallet {
 				.max(T::WeightInfo::approve_as_multi_approve(s))
 				.saturating_add(*max_weight)
 		})]
+		#[transactional]
 		pub fn approve_as_multi(
 			origin: OriginFor<T>,
 			threshold: u16,
@@ -483,6 +572,11 @@ pub mod pallet {
 
 			let err_amount = T::Currency::unreserve(&m.depositor, m.deposit);
 			debug_assert!(err_amount.is_zero());
+			let mut unexecuted_calls = UnexecutedCalls::<T>::get(&id);
+			if let Some((pos, _)) = unexecuted_calls.iter().enumerate().find(|(_, call)| call == &&call_hash) {
+				unexecuted_calls.remove(pos);
+				UnexecutedCalls::<T>::insert(&id, unexecuted_calls);
+			}
 			<Multisigs<T>>::remove(&id, &call_hash);
 
 			Self::deposit_event(Event::MultisigCancelled {
@@ -491,6 +585,33 @@ pub mod pallet {
 				multisig: id,
 				call_hash,
 			});
+			Ok(())
+		}
+
+		// todo: weight
+		#[pallet::call_index(4)]
+		#[pallet::weight(T::WeightInfo::cancel_as_multi(other_signatories.len() as u32))]
+		#[transactional]
+		pub fn register_multi_account(
+			origin: OriginFor<T>,
+			threshold: u16,
+			other_signatories: Vec<T::AccountId>,
+		) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			let max_sigs = T::MaxSignatories::get() as usize;
+			ensure!(!other_signatories.is_empty(), Error::<T>::TooFewSignatories);
+			let other_signatories_len = other_signatories.len();
+			ensure!(other_signatories_len < max_sigs, Error::<T>::TooManySignatories);
+			let signatories = Self::ensure_sorted_and_insert(other_signatories, who.clone())?;
+			let id = Self::multi_account_id(&signatories, threshold);
+			ensure!(!MultisigsForAccount::<T>::get(&who).iter().any(|v| v.multisig == id), Error::<T>::MultisigAlreadyRegistered);
+
+			Self::do_register_multisig(
+				who,
+				threshold,
+				signatories,
+				id
+			)?;
 			Ok(())
 		}
 	}
@@ -523,14 +644,32 @@ impl<T: Config> Pallet<T> {
 		let signatories = Self::ensure_sorted_and_insert(other_signatories, who.clone())?;
 
 		let id = Self::multi_account_id(&signatories, threshold);
-
+		if !MultisigsForAccount::<T>::get(&who).iter().any(|v| v.multisig == id) {
+			Self::do_register_multisig(
+				who.clone(),
+				threshold,
+				signatories,
+				id.clone()
+			)?;
+		}
 		// Threshold > 1; this means it's a multi-step operation. We extract the `call_hash`.
 		let (call_hash, call_len, maybe_call) = match call_or_hash {
 			CallOrHash::Call(call) => {
-				let (call_hash, call_len) = call.using_encoded(|d| (blake2_256(d), d.len()));
+				let (call_hash, call_len) = call.using_encoded(|d| (blake2_256(&(d, Self::timepoint()).encode()), d.len()));
 				(call_hash, call_len, Some(call))
 			},
-			CallOrHash::Hash(h) => (h, 0, None),
+			CallOrHash::Hash(h) => {
+				let call = if let Some(multisigs) = <Multisigs<T>>::get(&id, &h) {
+					if let Some(call) = multisigs.call {
+						Some(<T as Config>::RuntimeCall::decode(&mut call.as_slice()).map_err(|_| Error::<T>::InvalidCall)?)
+					} else {
+						None
+					}
+				} else {
+					None
+				};
+				(h, 0, call)
+			},
 		};
 
 		// Branch on whether the operation has already started or not.
@@ -538,6 +677,7 @@ impl<T: Config> Pallet<T> {
 			// Yes; ensure that the timepoint exists and agrees.
 			let timepoint = maybe_timepoint.ok_or(Error::<T>::NoTimepoint)?;
 			ensure!(m.when == timepoint, Error::<T>::WrongTimepoint);
+			ensure!(!m.finished, Error::<T>::CallExecuted);
 
 			// Ensure that either we have not yet signed or that it is at threshold.
 			let mut approvals = m.approvals.len() as u16;
@@ -556,12 +696,28 @@ impl<T: Config> Pallet<T> {
 					Error::<T>::MaxWeightTooLow
 				);
 
-				// Clean up storage before executing call to avoid an possibility of reentrancy
-				// attack.
-				<Multisigs<T>>::remove(&id, call_hash);
 				T::Currency::unreserve(&m.depositor, m.deposit);
+				// update state
+				m.finished = true;
+				<Multisigs<T>>::insert(&id, &call_hash, m);
 
 				let result = call.dispatch(RawOrigin::Signed(id.clone()).into());
+				// update ExecutedCalls
+				let mut executed_calls = ExecutedCalls::<T>::get(&id);
+				let pos = executed_calls.len() as usize;
+				if pos >= T::MaxCalls::get() as usize {
+					// remove the first call
+					executed_calls.remove(0);
+				}
+				executed_calls.try_insert(pos, call_hash).expect("insert executed calls should successfully");
+				ExecutedCalls::<T>::insert(&id, executed_calls);
+				// update UnexecutedCalls
+				let mut unexecuted_calls = UnexecutedCalls::<T>::get(&id);
+				if let Some((pos, _)) = unexecuted_calls.iter().enumerate().find(|(_, call)| call == &&call_hash) {
+					unexecuted_calls.remove(pos);
+					UnexecutedCalls::<T>::insert(&id, unexecuted_calls);
+				}
+
 				Self::deposit_event(Event::MultisigExecuted {
 					approving: who,
 					timepoint,
@@ -608,10 +764,16 @@ impl<T: Config> Pallet<T> {
 		} else {
 			// Not yet started; there should be no timepoint given.
 			ensure!(maybe_timepoint.is_none(), Error::<T>::UnexpectedTimepoint);
+			let mut unexecuted_calls = UnexecutedCalls::<T>::get(&id);
+			let pos = unexecuted_calls.len() as usize;
+			if pos >= T::MaxCalls::get() as usize {
+				// remove the first call
+				unexecuted_calls.remove(0);
+			}
+			unexecuted_calls.try_insert(pos, call_hash).expect("insert unexecuted calls should successfully");
 
 			// Just start the operation by recording it in storage.
 			let deposit = T::DepositBase::get() + T::DepositFactor::get() * threshold.into();
-
 			T::Currency::reserve(&who, deposit)?;
 
 			let initial_approvals =
@@ -625,8 +787,12 @@ impl<T: Config> Pallet<T> {
 					deposit,
 					depositor: who.clone(),
 					approvals: initial_approvals,
+					call: maybe_call.map(|call| call.encode().try_into().expect("Runtime call must encode successfully")),
+					finished: false,
 				},
 			);
+			UnexecutedCalls::<T>::insert(&id, unexecuted_calls);
+
 			Self::deposit_event(Event::NewMultisig { approving: who, multisig: id, call_hash });
 
 			let final_weight =
@@ -634,6 +800,37 @@ impl<T: Config> Pallet<T> {
 			// Call is not made, so the actual weight does not include call
 			Ok(Some(final_weight).into())
 		}
+	}
+
+	fn do_register_multisig(
+		who: T::AccountId,
+		threshold: u16,
+		signatories: Vec<T::AccountId>, // contains 'who'
+		multisig: T::AccountId,
+	) -> DispatchResult {
+		let deposit = T::DepositBase::get() + T::DepositFactor::get() * threshold.into();
+		T::Currency::transfer(
+			&who,
+			&T::TreasuryAccount::get(),
+			deposit,
+			frame_support::traits::ExistenceRequirement::AllowDeath,
+		)?;
+		for part in &signatories {
+			let mut list = MultisigsForAccount::<T>::get(&part);
+			let pos = list.len();
+			list.try_insert(pos, MultisigOrigin {
+				multisig: multisig.clone(),
+				signatories: signatories.clone().try_into().unwrap(), // already checked
+				threshold,
+			})
+				.map_err(|_| Error::<T>::TooManyMultisigs)?;
+			MultisigsForAccount::<T>::insert(&part, list);
+		}
+		Self::deposit_event(Event::MultiAccountCreated {
+			sender: who,
+			multisig,
+		});
+		Ok(())
 	}
 
 	/// The current `Timepoint`.

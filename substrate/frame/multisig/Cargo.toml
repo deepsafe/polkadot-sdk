@@ -21,6 +21,7 @@ scale-info = { version = "2.10.0", default-features = false, features = ["derive
 frame-benchmarking = { path = "../benchmarking", default-features = false, optional = true }
 frame-support = { path = "../support", default-features = false }
 frame-system = { path = "../system", default-features = false }
+pallet-sudo = { path = "../sudo", default-features = false }
 sp-io = { path = "../../primitives/io", default-features = false }
 sp-runtime = { path = "../../primitives/runtime", default-features = false }
 sp-std = { path = "../../primitives/std", default-features = false }
@@ -38,6 +39,7 @@ std = [
 	"frame-benchmarking?/std",
 	"frame-support/std",
 	"frame-system/std",
+	"pallet-sudo/std",
 	"log/std",
 	"pallet-balances/std",
 	"scale-info/std",
@@ -49,12 +51,14 @@ runtime-benchmarks = [
 	"frame-benchmarking/runtime-benchmarks",
 	"frame-support/runtime-benchmarks",
 	"frame-system/runtime-benchmarks",
+	"pallet-sudo/runtime-benchmarks",
 	"pallet-balances/runtime-benchmarks",
 	"sp-runtime/runtime-benchmarks",
 ]
 try-runtime = [
 	"frame-support/try-runtime",
 	"frame-system/try-runtime",
+	"pallet-sudo/try-runtime",
 	"pallet-balances/try-runtime",
 	"sp-runtime/try-runtime",
 ]

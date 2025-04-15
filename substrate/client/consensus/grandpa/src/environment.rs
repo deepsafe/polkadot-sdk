@@ -1217,14 +1217,14 @@ where
 			.header(target_hash)?
 			.expect("Header known to exist after `finality_target` call; qed"),
 		Err(err) => {
-			warn!(
+			debug!(
 				target: LOG_TARGET,
 				"Encountered error finding best chain containing {:?}: couldn't find target block: {}",
 				block,
 				err,
 			);
 
-			return Ok(None)
+			base_header.clone()
 		},
 	};
 

@@ -36,7 +36,7 @@ use secp256k1::Secp256k1;
 #[cfg(feature = "std")]
 use secp256k1::SECP256K1;
 #[cfg(feature = "full_crypto")]
-use secp256k1::{
+pub use secp256k1::{
 	ecdsa::{RecoverableSignature, RecoveryId},
 	Message, PublicKey, SecretKey,
 };

@@ -64,7 +64,7 @@ mod rep {
 	use sc_network::ReputationChange as Rep;
 
 	/// Reputation change when a peer sent us the same request multiple times.
-	pub const SAME_REQUEST: Rep = Rep::new_fatal("Same block request multiple times");
+	pub const SAME_REQUEST: Rep = Rep::new(-(1 << 25), "Same block request multiple times");
 
 	/// Reputation change when a peer sent us the same "small" request multiple times.
 	pub const SAME_SMALL_REQUEST: Rep =

@@ -809,7 +809,7 @@ impl<Block: BlockT> Inner<Block> {
 		self.live_topics.push(round, set_id);
 		self.peers.reshuffle();
 
-		self.multicast_neighbor_packet(false)
+		self.multicast_neighbor_packet()
 	}
 
 	/// Note that a voter set with given ID has started. Does nothing if the last
@@ -846,10 +846,7 @@ impl<Block: BlockT> Inner<Block> {
 		self.live_topics.push(Round(1), set_id);
 		self.authorities = authorities;
 
-		// when transitioning to a new set we also want to send neighbor packets to light clients,
-		// this is so that they know who to ask justifications from in order to finalize the last
-		// block in the previous set.
-		self.multicast_neighbor_packet(true)
+		self.multicast_neighbor_packet()
 	}
 
 	/// Note that we've imported a commit finalizing a given block. Does nothing if the last
@@ -868,7 +865,7 @@ impl<Block: BlockT> Inner<Block> {
 			return None
 		}
 
-		self.multicast_neighbor_packet(false)
+		self.multicast_neighbor_packet()
 	}
 
 	fn consider_vote(&self, round: Round, set_id: SetId) -> Consider {
@@ -1182,31 +1179,14 @@ impl<Block: BlockT> Inner<Block> {
 		(neighbor_topics, action, catch_up, report)
 	}
 
-	fn multicast_neighbor_packet(&self, force_light: bool) -> MaybeMessage<Block> {
+	fn multicast_neighbor_packet(&self) -> MaybeMessage<Block> {
 		self.local_view.as_ref().map(|local_view| {
 			let packet = NeighborPacket {
 				round: local_view.round,
 				set_id: local_view.set_id,
 				commit_finalized_height: *local_view.last_commit_height().unwrap_or(&Zero::zero()),
 			};
-
-			let peers = self
-				.peers
-				.inner
-				.iter()
-				.filter_map(|(id, info)| {
-					// light clients don't participate in the full GRANDPA voter protocol
-					// and therefore don't need to be informed about all view updates unless
-					// we explicitly require it (e.g. when transitioning to a new set)
-					if info.roles.is_light() && !force_light {
-						None
-					} else {
-						Some(id)
-					}
-				})
-				.cloned()
-				.collect();
-
+			let peers = self.peers.inner.iter().map(|(id, _)| id).cloned().collect();
 			(peers, packet)
 		})
 	}
@@ -2601,7 +2581,7 @@ mod tests {
 	}
 
 	#[test]
-	fn sends_neighbor_packets_to_non_light_peers_when_starting_a_new_round() {
+	fn sends_neighbor_packets_to_all_peers_when_starting_a_new_round() {
 		let (val, _) = GossipValidator::<Block>::new(config(), voter_set_state(), None, None);
 
 		// initialize the validator to a stable set id
@@ -2616,10 +2596,10 @@ mod tests {
 		val.inner.write().peers.new_peer(light_peer, ObservedRole::Light);
 
 		val.note_round(Round(2), |peers, message| {
-			assert_eq!(peers.len(), 2);
+			assert_eq!(peers.len(), 3);
 			assert!(peers.contains(&authority_peer));
 			assert!(peers.contains(&full_peer));
-			assert!(!peers.contains(&light_peer));
+			assert!(peers.contains(&light_peer));
 			assert!(matches!(message, NeighborPacket { set_id: SetId(1), round: Round(2), .. }));
 		});
 	}

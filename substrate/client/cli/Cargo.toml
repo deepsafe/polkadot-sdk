@@ -50,6 +50,7 @@ sp-keystore = { path = "../../primitives/keystore" }
 sp-panic-handler = { path = "../../primitives/panic-handler" }
 sp-runtime = { path = "../../primitives/runtime" }
 sp-version = { path = "../../primitives/version" }
+sp-io = { path = "../../primitives/io" }
 
 [dev-dependencies]
 tempfile = "3.1.0"
